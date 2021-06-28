@@ -92,11 +92,8 @@ func ScanWithRetry(ctx context.Context, rdb *redis.Client, opt ScanOption,
 
 type Stat map[string]uint64
 
-func (s Stat) Update(keys []string, filter func(k string) string) {
-	for _, k := range keys {
-		r := filter(k)
-		s[r] += 1
-	}
+func (s Stat) Inc(key string) {
+	s[key] += 1
 }
 
 func (s Stat) Print() {
@@ -105,7 +102,7 @@ func (s Stat) Print() {
 		keys = append(keys, k)
 	}
 	sort.Sort(sort.StringSlice(keys))
-	fmt.Println("#pattern number")
+	fmt.Println("#group keys")
 	for _, k := range keys {
 		v := s[k]
 		fmt.Printf("%s %d\n", k, v)
@@ -116,35 +113,44 @@ type TemplateData struct {
 	Matches []string
 }
 
-type Patcher struct {
-	Filter string
-	Into   string
-	tpl    *template.Template
-	reg    *regexp.Regexp
+type Grouper struct {
+	tpls []*template.Template
+	reg  *regexp.Regexp
 }
 
-func NewPatcher(f string, into string) (*Patcher, error) {
-	r, err := regexp.Compile(f)
+func NewGrouper(f string, into []string) (*Grouper, error) {
+	pattern, err := regexp.Compile(f)
 	if err != nil {
 		return nil, fmt.Errorf("bad filter: %w", err)
 	}
-	t, err := parseTemplate(into, r)
-	if err != nil {
-		return nil, fmt.Errorf("bad template: %w", err)
+	var tpls []*template.Template
+	for _, r := range into {
+		t, err := parseTemplate(r, pattern)
+		if err != nil {
+			return nil, fmt.Errorf("bad template: %w", err)
+		}
+		tpls = append(tpls, t)
 	}
-	v := &Patcher{Filter: f, Into: into, reg: r, tpl: t}
+	v := &Grouper{reg: pattern, tpls: tpls}
 	return v, nil
 }
 
-func (f *Patcher) Flit(k string) string {
-	r := f.reg.FindStringSubmatch(k)
+func (g *Grouper) Group(k string, s Stat) error {
+	r := g.reg.FindStringSubmatch(k)
 	if len(r) == 0 {
-		return ""
+		s.Inc("")
+		return nil
 	}
 	v := &TemplateData{Matches: r}
 	sb := &strings.Builder{}
-	f.tpl.Execute(sb, v)
-	return sb.String()
+	for _, tpl := range g.tpls {
+		sb.Reset()
+		if err := tpl.Execute(sb, v); err != nil {
+			return fmt.Errorf("execute template error: %w", err)
+		}
+		s.Inc(sb.String())
+	}
+	return nil
 }
 
 func parseTemplate(pattern string, r *regexp.Regexp) (*template.Template, error) {
@@ -225,7 +231,7 @@ type Opt struct {
 	Retry    uint64
 	Max      uint64
 	Pattern  string
-	Replace  string
+	Replace  []string
 }
 
 func (o *Opt) init() {
@@ -236,16 +242,21 @@ func (o *Opt) init() {
 }
 
 var patternAndReplaceHelp = `
-patter is an regex expression and replace is key statistic group result. 
-See an example of group keys by it's prefix:
-pattern is '(.*)_.*' and replace is '$1'`
+Examples:
+  group by whole key:
+    %[1]s '.*' '$0'
+  group by key's prefix:
+    %[1]s '(.*)_.*' '$1'
+  group by key's suffix and prefix:
+    %[1]s '(.*)_(.*)' '$1' '$2'
+`
 
 func (o *Opt) parseCommandLine() {
 	o.init()
 	name := filepath.Base(os.Args[0])
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [Options...] pattern replace\n", name)
-		fmt.Fprintf(flag.CommandLine.Output(), patternAndReplaceHelp + "\n\nOptions:\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [OPTION...] pattern group...\n", name)
+		fmt.Fprintf(flag.CommandLine.Output(), patternAndReplaceHelp+"\n\nOptions:\n", name)
 		flag.PrintDefaults()
 	}
 	flag.StringVar(&o.Host, "h", o.Host, "Server hostname")
@@ -256,10 +267,16 @@ func (o *Opt) parseCommandLine() {
 	flag.Uint64Var(&o.Max, "max", o.Max, "Max keys to scan")
 
 	flag.Parse()
+	if flag.NArg() < 2 {
+		fmt.Println("pattern or groups required")
+		flag.Usage()
+		os.Exit(1)
+	}
+
 	o.Pattern = flag.Arg(0)
-	o.Replace = flag.Arg(1)
-	if o.Pattern == "" || o.Replace == "" {
-		fmt.Println("pattern or replace required")
+	o.Replace = flag.Args()[1:]
+	if o.Pattern == "" || len(o.Replace) == 0 {
+		fmt.Println("pattern or groups required")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -272,6 +289,10 @@ func fatalTest(err error) {
 	}
 }
 
+func eprintln(o ...interface{}) {
+	fmt.Fprintln(os.Stderr, o...)
+}
+
 func main() {
 	var o Opt
 	o.parseCommandLine()
@@ -279,7 +300,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	rdb, err := Connect(ctx, o.Host, o.Port, o.Password)
 	fatalTest(err)
-	f, err := NewPatcher(o.Pattern, o.Replace)
+	g, err := NewGrouper(o.Pattern, o.Replace)
 	fatalTest(err)
 
 	scanopts := ScanOption{
@@ -289,7 +310,12 @@ func main() {
 	stats := make(Stat)
 	var total uint64
 	filter := func(keys []string) bool {
-		stats.Update(keys, f.Flit)
+		for _, k := range keys {
+			if err := g.Group(k, stats); err != nil {
+				eprintln(err)
+				return false
+			}
+		}
 		total += uint64(len(keys))
 		if total > o.Max {
 			return false
