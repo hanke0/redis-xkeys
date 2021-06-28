@@ -68,4 +68,4 @@ tags
 .idea/
 tmp/
 CPPLINT.cfg
-redis-key-stats
+redis-key-stats*
