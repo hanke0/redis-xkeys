@@ -6,18 +6,22 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/gosuri/uilive"
 )
 
 func Connect(ctx context.Context, host string, port int, password string) (*redis.Client, error) {
@@ -90,23 +94,49 @@ func ScanWithRetry(ctx context.Context, rdb *redis.Client, opt ScanOption,
 	return nil
 }
 
-type Stat map[string]uint64
-
-func (s Stat) Inc(key string) {
-	s[key] += 1
+type Stat struct {
+	mu    sync.RWMutex
+	keys  []string
+	count map[string]uint64
 }
 
-func (s Stat) Print() {
-	var keys []string
-	for k := range s {
-		keys = append(keys, k)
+func (s *Stat) Sort() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sort.Sort(sort.StringSlice(s.keys))
+}
+
+func (s *Stat) Inc(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count == nil {
+		s.count = make(map[string]uint64)
 	}
-	sort.Sort(sort.StringSlice(keys))
-	fmt.Println("#group keys")
-	for _, k := range keys {
-		v := s[k]
-		fmt.Printf("%s %d\n", k, v)
+	if _, ok := s.count[key]; !ok {
+		s.keys = append(s.keys, key)
 	}
+	s.count[key] += 1
+}
+
+func (s *Stat) Output(w io.Writer) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fmt.Fprintln(w, "#group keys")
+	for _, k := range s.keys {
+		v := s.count[k]
+		fmt.Fprintf(w, "%s %d\n", k, v)
+	}
+}
+
+func (s *Stat) Print() {
+	s.Output(os.Stdout)
+	os.Stdout.Sync()
+}
+
+func (s *Stat) Len() int {
+	s.mu.RLock()
+	s.mu.RUnlock()
+	return len(s.count)
 }
 
 type TemplateData struct {
@@ -135,7 +165,7 @@ func NewGrouper(f string, into []string) (*Grouper, error) {
 	return v, nil
 }
 
-func (g *Grouper) Group(k string, s Stat) error {
+func (g *Grouper) Group(k string, s *Stat) error {
 	r := g.reg.FindStringSubmatch(k)
 	if len(r) == 0 {
 		s.Inc("")
@@ -293,7 +323,15 @@ func eprintln(o ...interface{}) {
 	fmt.Fprintln(os.Stderr, o...)
 }
 
+func eprintf(f string, o ...interface{}) {
+	fmt.Fprintf(os.Stderr, f, o...)
+}
+
 func main() {
+	// old go version go max
+	if runtime.GOMAXPROCS(-1) == 1 {
+		runtime.GOMAXPROCS(runtime.NumCPU())
+	}
 	var o Opt
 	o.parseCommandLine()
 
@@ -307,7 +345,7 @@ func main() {
 		Match: o.Match,
 		Retry: o.Retry,
 	}
-	stats := make(Stat)
+	stats := new(Stat)
 	var total uint64
 	filter := func(keys []string) bool {
 		for _, k := range keys {
@@ -327,14 +365,32 @@ func main() {
 	go func() {
 		for {
 			<-sigs
-			fmt.Println("wait cancel")
+			eprintln("wait cancel")
 			cancel()
 		}
 	}()
 
 	start := time.Now()
+	go func() {
+		uilive.Out = os.Stderr
+		w := uilive.New()
+		tick := time.NewTicker(time.Millisecond * 500)
+		defer tick.Stop()
+		defer w.Flush()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				break
+			}
+			fmt.Fprintf(w, "scan keys: %d, groups: %d, spend: %s\n", total, stats.Len(), time.Since(start))
+			w.Flush()
+		}
+	}()
 	err = ScanWithRetry(ctx, rdb, scanopts, filter)
+	stats.Sort()
 	stats.Print()
-	fmt.Printf("\nscan keys: %d, spend: %s\n", total, time.Since(start))
+	eprintf("\nscan keys: %d, groups: %d, spend: %s\n", total, stats.Len(), time.Since(start))
 	fatalTest(err)
 }
