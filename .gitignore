@@ -64,4 +64,4 @@ tags
 .idea/
 tmp/
 CPPLINT.cfg
-redis-xscan*
+redis*
