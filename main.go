@@ -324,6 +324,7 @@ func (t *Basic) Result(w io.Writer) error {
 	fmt.Fprintf(w, "start_at:%s\n", t.start)
 	fmt.Fprintf(w, "total_spend_time:%s\n", time.Since(t.start))
 	fmt.Fprintf(w, "total_scan_keys:%d\n", t.keys)
+	fmt.Fprintf(w, "scan_keys_speed:%.f/s\n", float64(t.keys)/time.Since(t.start).Seconds())
 	fmt.Fprintf(w, "avg_key_size:%.0f\n", t.avgKeySize)
 	fmt.Fprintf(w, "max_key_size:%d\n", t.maxKeySize)
 	fmt.Fprintf(w, "last_cursor:%d\n", t.cursor)
