@@ -72,7 +72,7 @@ func (i *uint16Value) Get() interface{} { return uint16(*i) }
 
 func (i *uint16Value) String() string { return strconv.FormatUint(uint64(*i), 10) }
 
-const usage = `redis-xkeys 0.3.0
+const usage = `redis-xkeys 0.3.1
 
 redis-xkeys scans all redis keys and prints a briefing.
 
