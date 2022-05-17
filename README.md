@@ -4,35 +4,25 @@ A command line tools for statistic of redis keys based on scan command
 
 ## How to get
 
-`go get -u github.com/ko-han/redis-key-stats`
+`go get -u github.com/ko-han/redis-xscan`
 
 ## Example
 ```bash
-» redis-cli set 1_a aa
+» redis-cli set group_name value
 OK
-» redis-key-stats '(.*)_a' '$1'
-#pattern number
-a 1
+» redis-xscan 0 group '^(.+)_(.+)$' '$1'
+# Basic
+start_at: 2022-05-17 19:26:53.846204147 +0800 CST m=+0.001160364
+total_spend_time: 1.225106ms
+total_scan_keys: 1
+avg_key_size: 10
+max_key_size: 10
+last_cursor: 0
 
-scan keys: 1, spend: 1.881753ms
-» ./redis-key-stats --help
-Usage: main [Options...] pattern replace
+# Group ^(.+)_(.+)$ $1
+group 1
+<not-matched> 0
 
-patter is an regex expression and replace is key statistic group result. 
-See an example of group keys by it's prefix:
-pattern is '(.*)_.*' and replace is '$1'
+» redis-xcan --help
 
-Options:
-  -a string
-        Password to use when connecting to the server
-  -h string
-        Server hostname (default "localhost")
-  -m string
-        Redis scan match pattern
-  -max uint
-        Max keys to scan (default 18446744073709551615)
-  -p int
-        Server port (default 6379)
-  -r uint
-        Retry times (default 10)
 ```

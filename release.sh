@@ -2,7 +2,7 @@
 
 ARCH='amd64'
 
-NAME=redis-key-stats
+NAME=redis-xkeys
 
 GOOS="linux" GOARCH=$ARCH go build -o $NAME-linux-$ARCH
 GOOS="darwin" GOARCH=$ARCH go build -o $NAME-darwin-$ARCH

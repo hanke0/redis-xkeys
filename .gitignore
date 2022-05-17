@@ -41,10 +41,6 @@ tags
 *.dylib
 *.dll
 
-# Fortran module files
-*.mod
-*.smod
-
 # Compiled Static libraries
 *.lai
 *.la
@@ -68,4 +64,4 @@ tags
 .idea/
 tmp/
 CPPLINT.cfg
-redis-key-stats*
+redis-xscan*
