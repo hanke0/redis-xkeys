@@ -100,7 +100,7 @@ The GROUPTYPE option
 It prints keys count as they are grouped by their type.
 
 The LIMIT option
-Iterate at this most keys. If not set, xcan will iter all keys stored in redis server.
+Iterate at this most keys. If not set, xscan will iter all keys stored in redis server.
 
 The DISTINCT option
 It uses an regex pattern to match keys, increases count by one if matched.
