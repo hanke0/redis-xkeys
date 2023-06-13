@@ -1,6 +1,6 @@
-module github.com/ko-han/redis-xkeys
+module github.com/hanke0/redis-xkeys
 
-go 1.17
+go 1.20
 
 require (
 	github.com/gdamore/tcell/v2 v2.5.1

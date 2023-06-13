@@ -8,7 +8,7 @@ linters-settings:
   gocyclo:
     min-complexity: 20
   goimports:
-    local-prefixes: github.com/ko-han/redis-xkeys
+    local-prefixes: github.com/hanke0/redis-xkeys
   revive:
     confidence: 0
   govet:
