@@ -4,7 +4,8 @@ A command line tools for statistic of redis keys based on scan command
 
 ## How to get
 
-`go get -u github.com/ko-han/redis-xkeys`
+`go install github.com/hanke0/redis-xkeys@latest`
+or download release page binary files.
 
 ## Example
 ```bash
@@ -24,7 +25,7 @@ group 1
 <not-matched> 0
 
 » redis-xkeys --help
-redis-xkeys 0.3.0
+redis-xkeys 0.5.0
 
 redis-xkeys scans all redis keys and prints a briefing.
 
