@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"reflect"
@@ -19,30 +18,28 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gdamore/tcell/v2"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/automaxprocs/maxprocs"
 )
 
 var config = struct {
 	Hostname   string  `opt:"h" help:"Server hostname"`
-	Port       uint16  `opt:"p" help:"Server port"`
+	Port       uint16  `opt:"p" help:"Server port" type:"port"`
 	Password   string  `opt:"a" help:"Password to use when connecting to the server" desc:"password"`
-	Interval   float64 `opt:"i" help:"Waits <interval> seconds per scan. It is possible to specify sub-second times like -i 0.1"`
+	Interval   float64 `opt:"i" help:"Waits <interval> seconds per scan. It is possible to specify sub-second times like 0.1"`
 	DB         int64   `opt:"n" help:"Database number"`
 	Help       bool    `opt:"help" help:"Output this help and exit"`
 	RetryTimes int64   `opt:"retry-times" help:"Retry times per scan when scan fails"`
 	BatchMode  bool    `opt:"b" help:"Start in batch mode, which could be useful for send output to other programs or to a file (default disable when STDOUT is not a tty)"`
-	Update     float64 `opt:"u" help:"Update result every <interval> seconds" desc:"interval"`
+	Update     float64 `opt:"u" help:"Update result every <interval> seconds"`
 	Timeout    float64 `opt:"timeout" help:"Timeout in seconds for redis command"`
+	ShowKeys   bool    `opt:"keys" help:"Show keys"`
 	Arguments  struct {
-		Cursor   uint64
-		Match    string
-		Limit    uint64
-		Type     *string
-		Count    int64
-		Group    [][2]string
-		Distinct []string
+		Cursor       uint64
+		Match        string
+		Type         string
+		Count        int64
+		Interceptors Interceptors
 	}
 }{
 	Hostname: "127.0.0.1",
@@ -77,19 +74,20 @@ const usage = `redis-xkeys 0.5.0
 redis-xkeys scans all redis keys and prints a briefing.
 
 Usage: redis-xkeys [OPTIONS] cursor [MATCH pattern] [COUNT count] [TYPE type] 
-                   [GROUP pattern replacement] [GROUPTYPE] [LIMIT limit]
-                   [DISTINCT pattern]
-`
-const usageSuffix = `
+                   [GROUP pattern replacement]... [GROUPTYPE] [LIMIT limit]
+                   [COUNTBYRE pattern]
+
 The Match option
-As same as redis scan match option.
+Only iterates elements match a give glob-style pattern.
+Pattern will passe to redis scan command directly.
 
 The COUNT option
-As same as redis scan count option.
+Set the number of elements every iteration returned.
+Count will passe to redis scan command directly.
 
 The TYPE option
-As same as redis scan type option. A type call to every key if redis-server 
-do  not support type option.
+Ask redis to only return objects that match a give type.
+A type call to every key if redis-server do not support scan type option.
 
 The GROUP option
 It uses an regex pattern to match and classify keys into groups.
@@ -100,57 +98,26 @@ The GROUPTYPE option
 It prints keys count as they are grouped by their type.
 
 The LIMIT option
-Iterate at this most keys. If not set, xscan will iter all keys stored in redis server.
+Iterate at this most keys.
 
-The DISTINCT option
+The COUNTBYRE option
 It uses an regex pattern to match keys, increases count by one if matched.
 Both matched count and un-matched count will be reported.
-It possible to add more than one DISTINCT option.
-`
+It possible to add more than one COUNTBYRE option.
 
-func newflag() *flag.FlagSet {
-	fg := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	fg.SetOutput(os.Stderr)
+OPTIONS:`
 
-	fg.Usage = func() {
-		fmt.Fprint(fg.Output(), usage)
-		fg.VisitAll(func(flag *flag.Flag) {
-			var b strings.Builder
-			if len(flag.Name) == 1 {
-				fmt.Fprintf(&b, "  -%s ", flag.Name) // Two spaces before -; see next two comments.
-			} else {
-				fmt.Fprintf(&b, "  --%s ", flag.Name)
-			}
-			usage := flag.Usage
-			if len(flag.Usage) > 60 {
-				var hb strings.Builder
-				var runeWrites int
-				for _, r := range flag.Usage {
-					if runeWrites < 55 { // find space in 5 characters.
-						hb.WriteRune(r)
-						runeWrites++
-						continue
-					}
-					if r < math.MaxUint8 && r != ' ' {
-						hb.WriteRune(r)
-						runeWrites++
-						continue
-					}
-					runeWrites = 0
-					hb.WriteString("\n\t\t")
-					if r != ' ' {
-						hb.WriteRune(r)
-					}
-				}
-				usage = hb.String()
-			}
-			b.WriteString(usage)
-			fmt.Fprint(fg.Output(), b.String(), "\n")
-		})
-		fmt.Fprint(fg.Output(), usageSuffix)
-	}
-	return fg
+// A Value
+type Value interface {
+	Set(s string) error
 }
+
+// Options ...
+type Options struct {
+	options map[string]Value
+}
+
+var options Options
 
 func parseOption(args []string) {
 	if len(args) == 0 {
@@ -164,9 +131,14 @@ func parseOption(args []string) {
 		}
 		return i
 	}
-
+	toInt64 := func(s string) int64 {
+		i, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			assert(errors.New("ERR syntax error"))
+		}
+		return i
+	}
 	config.Arguments.Cursor = toUint(cursor)
-
 	args = args[1:]
 	for i := 0; i < len(args); i++ {
 		getNext := func() string {
@@ -178,25 +150,29 @@ func parseOption(args []string) {
 		}
 		c := strings.ToLower(args[i])
 		switch c {
+		case "count":
+			config.Arguments.Count = toInt64(getNext())
 		case "match":
 			config.Arguments.Match = getNext()
 		case "limit":
-			config.Arguments.Limit = toUint(getNext())
+			max := toUint(getNext())
+			config.Arguments.Interceptors = append(config.Arguments.Interceptors,
+				NewLimiter(max))
 		case "group":
 			pa := getNext()
 			repl := getNext()
-			config.Arguments.Group = append(config.Arguments.Group, [2]string{pa, repl})
+			i, err := NewGroup(pa, repl)
+			assert(err)
+			config.Arguments.Interceptors = append(config.Arguments.Interceptors, i)
 		case "type":
 			tp := getNext()
-			config.Arguments.Type = &tp
+			config.Arguments.Type = tp
 		case "grouptype":
-			if config.Arguments.Type == nil {
-				a := ""
-				config.Arguments.Type = &a
-			}
-		case "distinct":
-			pa := getNext()
-			config.Arguments.Distinct = append(config.Arguments.Distinct, pa)
+			config.Arguments.Interceptors = append(config.Arguments.Interceptors, NewTyper(""))
+		case "countbyre":
+			i, err := NewCountByRE(getNext())
+			assert(err)
+			config.Arguments.Interceptors = append(config.Arguments.Interceptors, i)
 		default:
 			assert(errors.New("ERR syntax error"))
 		}
@@ -204,30 +180,19 @@ func parseOption(args []string) {
 }
 
 func initFlag() {
-	fg := newflag()
 	value := reflect.ValueOf(&config)
 	value = value.Elem()
-	numfield := value.NumField()
-	for i := 0; i < numfield; i++ {
+	num := value.NumField()
+	for i := 0; i < num; i++ {
 		f := value.Field(i)
 		sf := value.Type().Field(i)
 		opt := sf.Tag.Get("opt")
 		if opt == "" {
 			continue
 		}
-		desc, ok := sf.Tag.Lookup("desc")
-		if !ok {
-			desc = strings.ToLower(sf.Name)
-		}
-		if f.Kind() == reflect.Bool {
-			desc = "" // bool value should not contains any type description
-		}
 		help := sf.Tag.Get("help")
 
 		var usage strings.Builder
-		if desc != "" {
-			fmt.Fprintf(&usage, "<%s>", desc)
-		}
 		usage.WriteRune('\t')
 		usage.WriteString(help)
 		if !f.IsZero() {
@@ -238,7 +203,7 @@ func initFlag() {
 		switch f.Kind() {
 		case reflect.String:
 			ptr := f.Addr().Interface().(*string)
-			fg.StringVar(ptr, opt, *ptr, usage.String())
+			
 		case reflect.Uint16:
 			ptr := f.Addr().Interface().(*uint16)
 			fg.Var(newUint16Value(*ptr, ptr), opt, usage.String())
@@ -281,7 +246,7 @@ func (i Interceptors) Apply(rdb *redis.Client, cursor uint64, keys []string) boo
 	return true
 }
 
-func (i Interceptors) Result() {
+func (i Interceptors) PrintResult() {
 	var buf bytes.Buffer
 	for _, c := range i {
 		c.Result(&buf)
@@ -291,11 +256,11 @@ func (i Interceptors) Result() {
 }
 
 type Basic struct {
-	start      time.Time
-	keys       uint64
-	maxKeySize int
-	avgKeySize float64
-	cursor     uint64
+	start        time.Time
+	keys         uint64
+	maxKeyLength int
+	avgKeySize   float64
+	cursor       uint64
 }
 
 var _ Interceptor = (*Basic)(nil)
@@ -307,14 +272,16 @@ func NewBasic() *Basic {
 }
 
 func (t *Basic) Apply(rdb *redis.Client, cursor uint64, keys []string) ([]string, bool) {
-	var totalsize float64
+	var totalLength float64
 	for _, k := range keys {
-		if len(k) > t.maxKeySize {
-			t.maxKeySize = len(k)
+		if len(k) > t.maxKeyLength {
+			t.maxKeyLength = len(k)
 		}
-		totalsize += float64(len(k))
+		totalLength += float64(len(k))
 	}
-	t.avgKeySize = (t.avgKeySize*float64(t.keys) + totalsize) / (float64(t.keys) + float64(len(keys)))
+	if len(keys) > 0 {
+		t.avgKeySize = (t.avgKeySize*float64(t.keys) + totalLength) / (float64(t.keys) + float64(len(keys)))
+	}
 	t.keys += uint64(len(keys))
 	return keys, true
 }
@@ -325,8 +292,8 @@ func (t *Basic) Result(w io.Writer) error {
 	fmt.Fprintf(w, "total_spend_time:%s\n", time.Since(t.start))
 	fmt.Fprintf(w, "total_scan_keys:%d\n", t.keys)
 	fmt.Fprintf(w, "scan_keys_speed:%.f/s\n", float64(t.keys)/time.Since(t.start).Seconds())
-	fmt.Fprintf(w, "avg_key_size:%.0f\n", t.avgKeySize)
-	fmt.Fprintf(w, "max_key_size:%d\n", t.maxKeySize)
+	fmt.Fprintf(w, "avg_key_length:%.0f\n", t.avgKeySize)
+	fmt.Fprintf(w, "max_key_length:%d\n", t.maxKeyLength)
 	fmt.Fprintf(w, "last_cursor:%d\n", t.cursor)
 	return nil
 }
@@ -485,24 +452,24 @@ func (t *Typer) Result(w io.Writer) error {
 	return nil
 }
 
-type Distinct struct {
+type CountByRE struct {
 	patternStr string
 	matched    uint64
 	notMatched uint64
 	pattern    *regexp.Regexp
 }
 
-var _ Interceptor = (*Distinct)(nil)
+var _ Interceptor = (*CountByRE)(nil)
 
-func NewDistinct(pattern string) (*Distinct, error) {
+func NewCountByRE(pattern string) (*CountByRE, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
-	return &Distinct{patternStr: pattern, pattern: re}, nil
+	return &CountByRE{patternStr: pattern, pattern: re}, nil
 }
 
-func (d *Distinct) Apply(rdb *redis.Client, cursor uint64, keys []string) ([]string, bool) {
+func (d *CountByRE) Apply(rdb *redis.Client, cursor uint64, keys []string) ([]string, bool) {
 	for _, k := range keys {
 		if d.pattern.MatchString(k) {
 			d.matched++
@@ -513,8 +480,8 @@ func (d *Distinct) Apply(rdb *redis.Client, cursor uint64, keys []string) ([]str
 	return keys, true
 }
 
-func (d *Distinct) Result(w io.Writer) error {
-	fmt.Fprintf(w, "# Distinct %s\n", d.patternStr)
+func (d *CountByRE) Result(w io.Writer) error {
+	fmt.Fprintf(w, "# CountByRE %s\n", d.patternStr)
 	fmt.Fprintf(w, "matched:%d\n", d.matched)
 	fmt.Fprintf(w, "unmatched:%d\n", d.notMatched)
 	return nil
@@ -522,7 +489,6 @@ func (d *Distinct) Result(w io.Writer) error {
 
 func assert(err error) {
 	if err != nil {
-		finish()
 		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		quit(1)
 	}
@@ -531,7 +497,6 @@ func assert(err error) {
 // This should be changed when uses a tty.
 var (
 	beforeQuit = func() {}
-	finish     = func() {}
 	flush      = func(b *bytes.Buffer) {
 		if b.Bytes()[len(b.Bytes())-1] != '\n' {
 			b.WriteByte('\n')
@@ -542,68 +507,11 @@ var (
 )
 
 func quit(code int) {
-	finish()
 	beforeQuit()
 	os.Exit(code)
 }
 
-func setStdOut() {
-	flush = func(b *bytes.Buffer) {
-		os.Stdout.Write(b.Bytes())
-		os.Stdout.Sync()
-	}
-}
-
-func setupTTY() bool {
-	if config.BatchMode {
-		return false
-	}
-	// Initialize screen
-	s, err := tcell.NewScreen()
-	if err != nil {
-		return false
-	}
-	if err := s.Init(); err != nil {
-		return false
-	}
-	s.DisableMouse()
-	s.DisablePaste()
-	finish = func() {
-		s.Fini()
-	}
-	flush = func(b *bytes.Buffer) {
-		s.Clear()
-		for i := 0; ; i++ {
-			d, err := b.ReadBytes('\n')
-			s.SetContent(0, i, 0, []rune(string(d)), tcell.StyleDefault)
-			if err != nil {
-				break
-			}
-		}
-		s.Show()
-	}
-	go func() {
-		for {
-			// Poll event
-			ev := s.PollEvent()
-			// Process event
-			switch ev := ev.(type) {
-			case *tcell.EventResize:
-				s.Sync()
-			case *tcell.EventKey:
-				if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC {
-					quit(0)
-				}
-			}
-		}
-	}()
-	return true
-}
-
-func setupOutput() {
-	if setupTTY() {
-		return
-	}
+func listenTerminateEvent() {
 	c := make(chan os.Signal, 10)
 	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -641,6 +549,9 @@ func Connect(opt *redis.Options) (*redis.Client, error) {
 func SupportScanType(rdb *redis.Client) (supported bool, err error) {
 	err = retry(func() error {
 		err = rdb.ScanType(context.Background(), 0, "", 0, "string").Err()
+		if err == nil {
+			supported = true
+		}
 		if _, ok := err.(redis.Error); ok { // redis don't support type
 			return nil
 		}
@@ -652,10 +563,9 @@ func SupportScanType(rdb *redis.Client) (supported bool, err error) {
 func ScanWithRetry(rdb *redis.Client,
 	interceptors Interceptors, typ string) error {
 	var (
-		keys       []string
-		cursor     = config.Arguments.Cursor
-		tempcursor uint64
-		err        error
+		keys   []string
+		cursor = config.Arguments.Cursor
+		err    error
 	)
 	start := time.Now()
 	every := time.Duration(float64(time.Second) * config.Update)
@@ -670,21 +580,30 @@ func ScanWithRetry(rdb *redis.Client,
 		}
 	}
 	ctx := context.Background()
+	if typ != "" {
+		ok, err := SupportScanType(rdb)
+		assert(err)
+		if !ok {
+			a := Interceptors{NewTyper(typ)}
+			a = append(a, interceptors...)
+			interceptors = a
+		}
+	}
+
 	for {
 		err = retry(func() error {
 			if typ != "" {
-				keys, tempcursor, err = rdb.ScanType(ctx, cursor, config.Arguments.Match,
+				keys, cursor, err = rdb.ScanType(ctx, cursor, config.Arguments.Match,
 					config.Arguments.Count, typ).Result()
 			} else {
-				keys, tempcursor, err = rdb.Scan(ctx, cursor, config.Arguments.Match,
+				keys, cursor, err = rdb.Scan(ctx, cursor, config.Arguments.Match,
 					config.Arguments.Count).Result()
 			}
 			return err
 		})
 		if err != nil {
-			return fmt.Errorf("scan error:%w", err)
+			return fmt.Errorf("scan error:%v", err)
 		}
-		cursor = tempcursor
 		if !interceptors.Apply(rdb, cursor, keys) {
 			break
 		}
@@ -692,7 +611,7 @@ func ScanWithRetry(rdb *redis.Client,
 			break
 		}
 		if time.Since(start) > every {
-			interceptors.Result()
+			interceptors.PrintResult()
 			start = time.Now()
 		}
 		sleep()
@@ -717,43 +636,13 @@ func main() {
 		DB:           int(config.DB),
 	})
 	assert(err)
-	var interceptors Interceptors
-	interceptors = append(interceptors, NewBasic())
-	var typ string
-	if config.Arguments.Type != nil {
-		typ = *config.Arguments.Type
-		if typ != "" {
-			ok, err := SupportScanType(rdb)
-			assert(err)
-			if ok {
-				interceptors = append(interceptors, NewTyper(""))
-			}
-		} else {
-			interceptors = append(interceptors, NewTyper(""))
-		}
-	}
-
-	if config.Arguments.Limit > 0 {
-		interceptors = append(interceptors, NewLimiter(config.Arguments.Limit))
-	}
-
-	for _, v := range config.Arguments.Group {
-		g, err := NewGroup(v[0], v[1])
-		assert(err)
-		interceptors = append(interceptors, g)
-	}
-	for _, v := range config.Arguments.Distinct {
-		g, err := NewDistinct(v)
-		assert(err)
-		interceptors = append(interceptors, g)
-	}
-
-	setupOutput()
+	var interceptors = Interceptors{NewBasic()}
+	interceptors = append(interceptors, config.Arguments.Interceptors...)
+	listenTerminateEvent()
 	beforeQuit = func() {
-		setStdOut()
-		interceptors.Result()
+		interceptors.PrintResult()
 	}
-	err = ScanWithRetry(rdb, interceptors, typ)
+	err = ScanWithRetry(rdb, interceptors, config.Arguments.Type)
 	assert(err)
 	quit(0)
 }
